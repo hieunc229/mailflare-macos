@@ -1152,7 +1152,14 @@ final class MailStore {
 	private static func nameKey(_ email: String) -> String { "name.\(email.lowercased())" }
 
 	/// An inbox's label: a name the mailbox carries, else the sent-mail name, else the part before the @.
+	/// Inboxes of one account that would share a label (`info@` on several domains) show their address.
 	func label(_ address: Mailbox) -> String {
+		let name = ownLabel(address)
+		let shared = inboxAddresses(of: address.accountId).contains { $0.id != address.id && ownLabel($0) == name }
+		return shared ? address.inboxEmail : name
+	}
+
+	private func ownLabel(_ address: Mailbox) -> String {
 		let own = address.inboxLabel
 		let email = address.inboxEmail
 		let bare = email.split(separator: "@", maxSplits: 1).first.map(String.init) ?? email
