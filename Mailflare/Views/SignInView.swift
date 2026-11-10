@@ -37,7 +37,7 @@ struct SignInView: View {
 		}
 		.frame(width: 420)
 		// Tall enough that the provider dropdown opens in full.
-		.frame(minHeight: min(500, min(680, ModalMetrics.maxHeight)), maxHeight: min(680, ModalMetrics.maxHeight))
+		.frame(minHeight: min(500, maxHeight), maxHeight: maxHeight)
 		.background(AppTheme.background)
 		.overlay(alignment: .topTrailing) {
 			if isPopup {
@@ -268,6 +268,10 @@ struct SignInView: View {
 	}
 
 	// MARK: State
+
+	/// As a sheet the form stays inside the app window. The sign-in window has no app window behind it:
+	/// ModalMetrics would measure the sign-in window itself and shrink it on every keystroke.
+	private var maxHeight: CGFloat { isPopup ? min(680, ModalMetrics.maxHeight) : 680 }
 
 	private var usesIMAP: Bool {
 		switch provider.kind {
