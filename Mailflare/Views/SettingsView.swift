@@ -860,6 +860,9 @@ private struct ProviderEditor: View {
 	var save: () -> Void
 	var cancel: () -> Void
 
+	/// The Model dropdown's list height before it scrolls.
+	private static let modelListHeight: CGFloat = 180
+
 	@State private var loading = false
 	@State private var error: String?
 	/// Listing failed, so the model is typed by hand.
@@ -877,14 +880,18 @@ private struct ProviderEditor: View {
 		ModalScaffold(title: isNew ? "New Provider" : "Edit Provider", width: 460) {
 			VStack(alignment: .leading, spacing: 12) {
 				form
-				if let error {
-					Text(error).font(Typography.meta).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-				} else if !config.models.isEmpty {
-					Text("\(config.models.count) models available.").font(Typography.meta).foregroundStyle(.secondary)
+				VStack(alignment: .leading) {
+					if let error {
+						Text(error).font(Typography.meta).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+					} else if !config.models.isEmpty {
+						Text("\(config.models.count) models available.").font(Typography.meta).foregroundStyle(.secondary)
+					}
 				}
+				// Room for the dropdowns to open downward inside the sheet. The Model dropdown opens from
+				// the form's last row, so it needs its list, search field, padding and shadow below the
+				// form, however many rows the service adds above it. That also covers the Service list.
+				.frame(maxWidth: .infinity, minHeight: Self.modelListHeight + 50, alignment: .topLeading)
 			}
-			// Room for the dropdowns to open downward inside the sheet.
-			.frame(minHeight: 340, alignment: .top)
 		} footer: {
 			HStack(spacing: 8) {
 				Button { Task { await loadModels() } } label: {
@@ -953,7 +960,7 @@ private struct ProviderEditor: View {
 				SettingsPicker(
 					title: "Model", options: config.choices.map { ($0, $0) }, selection: $config.model,
 					isLoading: config.models.isEmpty, onOpen: { Task { await loadIfNeeded() } },
-					maxHeight: 180, fallbackLabel: config.model
+					maxHeight: Self.modelListHeight, fallbackLabel: config.model
 				)
 			}
 		}
