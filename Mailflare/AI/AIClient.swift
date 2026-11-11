@@ -32,6 +32,12 @@ struct AIClient {
 
 	static func listModels(baseURL: URL, apiKey: String) async throws -> [String] {
 		var request = request(baseURL.appendingPathComponent("models"), apiKey: apiKey)
+		// Anthropic lists models through its own API, not the OpenAI-compatible one, which requires
+		// a version header and returns 20 models per page unless asked for more.
+		if baseURL.host == "api.anthropic.com" {
+			request.setValue("2026-10-21", forHTTPHeaderField: "anthropic-version")
+			request.url?.append(queryItems: [URLQueryItem(name: "limit", value: "1000")])
+		}
 		request.timeoutInterval = 15
 		let (data, response) = try await URLSession.shared.data(for: request)
 		let status = (response as? HTTPURLResponse)?.statusCode ?? 0
