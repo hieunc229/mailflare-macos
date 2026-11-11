@@ -253,6 +253,9 @@ final class MailStore {
 	@ObservationIgnored private var pollTask: Task<Void, Never>?
 	/// Held while polling so App Nap does not stretch the poll interval of a hidden window.
 	@ObservationIgnored private var pollActivity: NSObjectProtocol?
+	/// Polls when the app comes to the front, so switching to it shows new mail at once.
+	@ObservationIgnored private var activationObserver: NSObjectProtocol?
+	@ObservationIgnored private var lastPoll = Date.distantPast
 	@ObservationIgnored private var olderTask: Task<Void, Never>?
 	@ObservationIgnored private var pageLimit = 50
 	private let pageSize = 50
@@ -835,6 +838,16 @@ final class MailStore {
 				self?.pollAll()
 			}
 		}
+		// Switching to the app checks at once instead of waiting up to a minute. Skipped right
+		// after a poll, so switching back and forth does not start a sync each time.
+		if activationObserver == nil {
+			activationObserver = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+				Task { @MainActor in
+					guard let self, Date().timeIntervalSince(self.lastPoll) > 10 else { return }
+					self.pollAll()
+				}
+			}
+		}
 	}
 
 	private func stopPolling() {
@@ -842,11 +855,14 @@ final class MailStore {
 		pollTask = nil
 		if let pollActivity { ProcessInfo.processInfo.endActivity(pollActivity) }
 		pollActivity = nil
+		if let activationObserver { NotificationCenter.default.removeObserver(activationObserver) }
+		activationObserver = nil
 	}
 
 	/// A quick sync of the account in view and of every other saved account, so mail for any of
 	/// them is noticed. Errors on the others are ignored; they show when that account is opened.
 	private func pollAll() {
+		lastPoll = Date()
 		sync(quick: true)
 		guard let core else { return }
 		let current = account?.id
