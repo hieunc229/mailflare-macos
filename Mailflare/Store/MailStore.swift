@@ -824,14 +824,15 @@ final class MailStore {
 
 	private func startPolling() {
 		pollTask?.cancel()
-		// Without this a hidden or occluded window is napped and the minute between polls can
-		// stretch to many, so new mail would be announced late. Idle system sleep is still allowed.
+		// Without this a hidden or occluded window is napped and the time between polls can
+		// stretch to minutes, so new mail would be announced late. Idle system sleep is still allowed.
 		if pollActivity == nil {
 			pollActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Checking for new mail")
 		}
 		pollTask = Task { [weak self] in
 			while !Task.isCancelled {
-				try? await Task.sleep(for: .seconds(60))
+				// Often enough that mail left waiting on the server is rarely noticed; a quick sync is cheap.
+				try? await Task.sleep(for: .seconds(20))
 				self?.pollAll()
 			}
 		}
