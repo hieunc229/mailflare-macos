@@ -415,11 +415,12 @@ struct MessageRow: View {
 					if message.hasAttachment { HIcon(.attachment, size: 13).foregroundStyle(.secondary) }
 					if message.flagged { HIcon(.flag, size: 13).foregroundStyle(.orange) }
 				}
+				Text(MailDate.list(message.date))
+					.font(Typography.meta).foregroundStyle(.secondary).lineLimit(1).fixedSize()
+				// In a unified list, the inbox the message is in follows its date.
 				if let sourceAccount {
 					ProfileAvatar(key: AvatarCache.key(account: sourceAccount), name: store.accountList.first { $0.id == sourceAccount }.map(store.accountName) ?? "?", size: 15)
 				}
-				Text(MailDate.list(message.date))
-					.font(Typography.meta).foregroundStyle(.secondary).lineLimit(1).fixedSize()
 			}
 			.overlay(alignment: .bottomLeading) {
 				unreadDot(isLast: preview.isEmpty && title.isEmpty && !isDraft, lineHeight: RowMetrics.bodyLine)

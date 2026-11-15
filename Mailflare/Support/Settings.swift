@@ -3,7 +3,7 @@ import ServiceManagement
 
 /// The pages of the Settings view, listed in the sidebar in this order.
 enum SettingsPage: String, CaseIterable, Identifiable {
-	case general, accounts, ai, notifications, license, support, about
+	case general, accounts, ai, mcp, notifications, license, support, about
 
 	var id: String { rawValue }
 
@@ -13,6 +13,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
 		case .notifications: "Notifications"
 		case .accounts: "Accounts"
 		case .ai: "AI Providers"
+		case .mcp: "MCP Credentials"
 		case .license: "License"
 		case .support: "Support"
 		case .about: "Version"
@@ -25,6 +26,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
 		case .notifications: .bell
 		case .accounts: .allInboxes
 		case .ai: .sparkles
+		case .mcp: .link
 		case .license: .vip
 		case .support: .support
 		case .about: .info
@@ -47,7 +49,7 @@ enum SettingsSection: CaseIterable, Identifiable {
 
 	var pages: [SettingsPage] {
 		switch self {
-		case .general: [.general, .accounts, .notifications, .ai]
+		case .general: [.general, .accounts, .notifications, .ai, .mcp]
 		case .about: [.license, .support, .about]
 		}
 	}
@@ -59,6 +61,10 @@ enum ReadingSettings {
 	static let loadRemoteContentKey = "loadRemoteContent"
 	static let autoCheckUpdatesKey = "autoCheckUpdates"
 	static let showAvatarsKey = "showListAvatars"
+	static let offlineDepthKey = "offlineDepth"
+
+	/// How many messages of each folder are kept on this Mac for offline reading and search.
+	static var offlineDepth: Int { UserDefaults.standard.object(forKey: offlineDepthKey) as? Int ?? 1000 }
 
 	/// Whether the message list shows a sender avatar beside each row.
 	static var showAvatars: Bool { UserDefaults.standard.object(forKey: showAvatarsKey) as? Bool ?? true }

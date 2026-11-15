@@ -225,10 +225,13 @@ struct WindowVisibility: NSViewRepresentable {
 /// along a hairline. It always occupies its 2pt of height, so showing it never shifts the layout.
 struct LoaderBar: View {
 	var isActive: Bool
+	/// Waits a moment before showing, so a load that finishes at once never flashes the bar (and
+	/// never starts the animation, which redraws at the display's rate).
+	@State private var isShown = false
 
 	var body: some View {
 		ZStack {
-			if isActive {
+			if isActive && isShown {
 				TimelineView(.animation) { timeline in
 					GeometryReader { geo in
 						let t = timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.3) / 1.3
@@ -243,6 +246,11 @@ struct LoaderBar: View {
 		}
 		.frame(height: 2)
 		.frame(maxWidth: .infinity)
+		.task(id: isActive) {
+			guard isActive else { isShown = false; return }
+			try? await Task.sleep(for: .milliseconds(250))
+			if !Task.isCancelled { isShown = true }
+		}
 		.background(isActive ? AppTheme.cardStroke : Color.clear)
 		.clipped()
 		.animation(.easeInOut(duration: 0.15), value: isActive)

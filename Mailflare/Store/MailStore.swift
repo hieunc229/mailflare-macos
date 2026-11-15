@@ -51,6 +51,8 @@ final class MailStore {
 	var displayBrandName: String { license.brandName ?? brandName }
 	let license = LicenseManager()
 	let ai = AISettings()
+	/// Remote MCP servers the assistant can use, with their secrets in the Keychain.
+	let mcp = MCPStore()
 	let chat = AIChatModel()
 	/// Whether the panel is showing: open, and a provider is set up to answer.
 	var chatVisible: Bool { chatOpen && ai.isConfigured }
@@ -58,6 +60,11 @@ final class MailStore {
 	var chatOpen = UserDefaults.standard.bool(forKey: "chatOpen") {
 		didSet { UserDefaults.standard.set(chatOpen, forKey: "chatOpen") }
 	}
+	/// Whether the assistant fills the window, pushing the mail columns aside. Not remembered: the app
+	/// always starts with the assistant at its usual size.
+	var chatExpanded = false
+	/// The assistant is showing and expanded.
+	var chatFillsWindow: Bool { chatVisible && chatExpanded }
 	var mailCore: MailCore? { core }
 	var currentAccountID: String { accountID }
 	/// The raw id of the email in the reader, for the assistant's context.
@@ -85,6 +92,8 @@ final class MailStore {
 	var adaptColors = true
 	var unreadOnly = false
 	var compose: ComposeDraft?
+	/// The image open in the full-window editor.
+	var imageEditor: ImageEditSession?
 
 	/// Inbox views: named sets of inboxes, across accounts, listed together. Saved on this Mac.
 	var inboxViews: [InboxView] = MailStore.loadInboxViews()
@@ -97,8 +106,15 @@ final class MailStore {
 	/// worked out again then, whatever else they happen to read: a count with the default scope reads
 	/// nothing else that changes when a message is read.
 	private(set) var mailRevision = 0
-	/// The view whose inboxes are listed; nil lists the account in view as usual.
-	var activeViewID: String?
+	/// The view whose inboxes are listed; nil lists the account in view as usual. Kept across
+	/// launches, so the app reopens on the Unified Inbox (or the view) it was closed on.
+	var activeViewID: String? {
+		didSet { if activeViewID != oldValue { UserDefaults.standard.set(activeViewID, forKey: Self.activeViewKey) } }
+	}
+	private static let activeViewKey = "activeViewID"
+	private static let lastAccountKey = "lastAccountID"
+	/// The view that was open when the app last quit, until the first account is opened.
+	@ObservationIgnored private var launchViewID: String? = UserDefaults.standard.string(forKey: MailStore.activeViewKey)
 	/// The view open in the create/edit popup.
 	var inboxViewEditor: InboxView?
 	/// The folder popup in view: a new folder, or a rename or delete of one.
@@ -273,6 +289,7 @@ final class MailStore {
 			quickReplies = QuickReplies(file: base.appendingPathComponent("quick-replies.json"))
 			let core = try MailCore(dataDir: base.path, credentials: KeychainCredentialStore())
 			core.setListener(listener: events)
+			core.setOfflineDepth(depth: UInt32(clamping: ReadingSettings.offlineDepth))
 			self.core = core
 		} catch {
 			banner = "Could not open the mail database (\(Self.dataDirectoryDescription)): \(describe(error))"
@@ -301,7 +318,8 @@ final class MailStore {
 			return
 		}
 		#endif
-		if let first = try? core.accounts().first {
+		let saved = (try? core.accounts()) ?? []
+		if let first = saved.first(where: { $0.id == UserDefaults.standard.string(forKey: Self.lastAccountKey) }) ?? saved.first {
 			if KeychainCredentialStore().load(accountId: first.id) == nil {
 				// Cached mail stays on disk; signing in again replaces the key for the same account.
 				endSession("Your saved sign-in could not be read from the Keychain. Sign in again.")
@@ -530,6 +548,13 @@ final class MailStore {
 		showAddAccount = false
 		activeViewID = nil
 		focus = nil
+		UserDefaults.standard.set(account.id, forKey: Self.lastAccountKey)
+		// Opening the app again returns to the view it was closed on, if that view still exists.
+		if let saved = launchViewID {
+			launchViewID = nil
+			let exists = saved == Self.allAccountsID ? !allAccountsView.members.isEmpty : inboxViews.contains { $0.id == saved }
+			if exists { activeViewID = saved }
+		}
 		banner = nil
 		connectionNote = nil
 		phase = .ready
@@ -537,14 +562,21 @@ final class MailStore {
 		selectedID = nil; detail = nil
 		refreshMailboxes()
 		reload()
-		loadBrand()
-		refreshLicenses()
-		for a in accountList { loadAvatars(for: a); loadNames(for: a) }
 		// Record what each inbox holds now, so only mail arriving after this is announced.
 		for a in accountList { checkNewMail(accountID: a.id) }
-		Task { await notifier.prepare() }
 		sync()
+		startPush()
 		startPolling()
+		// Nothing below is needed to show the inbox, so it waits for the first frame.
+		Task { [weak self] in
+			try? await Task.sleep(for: .milliseconds(200))
+			guard let self, self.phase == .ready else { return }
+			WebViewWarmup.run()
+			self.loadBrand()
+			self.refreshLicenses()
+			for a in self.accountList { self.loadAvatars(for: a); self.loadNames(for: a) }
+			await self.notifier.prepare()
+		}
 	}
 
 	func switchAccount(_ target: Account) {
@@ -564,6 +596,7 @@ final class MailStore {
 	/// Signs out one saved account: the one in view the usual way, any other quietly in the background.
 	func signOut(_ target: Account) {
 		if target.id == account?.id { signOut(); return }
+		pushed.remove(target.id)
 		try? core?.signOut(accountId: target.id)
 		profiles.forget(target.id)
 		quickReplies.forget(account: target.id)
@@ -573,7 +606,7 @@ final class MailStore {
 
 	func signOut(notice: String? = nil) {
 		stopPolling()
-		if let id = account?.id { try? core?.signOut(accountId: id); profiles.forget(id); quickReplies.forget(account: id) }
+		if let id = account?.id { pushed.remove(id); try? core?.signOut(accountId: id); profiles.forget(id); quickReplies.forget(account: id) }
 		account = nil; mailboxes = []; identities = []; messages = []; detail = nil; selectedID = nil
 		compose = nil; minimizedDraft = nil; searchText = ""; settingsPage = nil
 		chat.reset()
@@ -822,18 +855,46 @@ final class MailStore {
 		banner = notice
 	}
 
+	/// Accounts the core keeps current by itself (IMAP IDLE), so they are polled only now and then.
+	@ObservationIgnored private var pushed: Set<String> = []
+	@ObservationIgnored private var lastPolled: [String: Date] = [:]
+	/// How long a pushed account goes between safety polls.
+	private let pushedPollInterval: TimeInterval = 600
+
+	/// Asks the core to hold a push connection for every account that can have one.
+	private func startPush() {
+		guard let core else { return }
+		for a in accountList where KeychainCredentialStore().load(accountId: a.id) != nil {
+			if core.startPush(accountId: a.id) { pushed.insert(a.id) }
+		}
+	}
+
 	private func startPolling() {
 		pollTask?.cancel()
-		// Without this a hidden or occluded window is napped and the minute between polls can
-		// stretch to many, so new mail would be announced late. Idle system sleep is still allowed.
-		if pollActivity == nil {
-			pollActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Checking for new mail")
-		}
+		updatePollActivity()
 		pollTask = Task { [weak self] in
 			while !Task.isCancelled {
-				try? await Task.sleep(for: .seconds(60))
+				// Only accounts without push need the minute: the rest are checked a few times an hour.
+				let interval = (self?.pollInterval ?? 60)
+				try? await Task.sleep(for: .seconds(interval), tolerance: .seconds(interval / 6))
 				self?.pollAll()
 			}
+		}
+	}
+
+	private var pollInterval: Int { accountList.allSatisfy { pushed.contains($0.id) } ? Int(pushedPollInterval) : 60 }
+
+	/// Without this a hidden or occluded window is napped and the minute between polls can stretch
+	/// to many, so new mail would be announced late. It is held only while an account needs polling:
+	/// a pushed account is woken by its connection, so the app can nap like any idle one. Idle
+	/// system sleep is still allowed.
+	private func updatePollActivity() {
+		let needed = accountList.contains { !pushed.contains($0.id) }
+		if needed, pollActivity == nil {
+			pollActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Checking for new mail")
+		} else if !needed, let activity = pollActivity {
+			ProcessInfo.processInfo.endActivity(activity)
+			pollActivity = nil
 		}
 	}
 
@@ -844,13 +905,22 @@ final class MailStore {
 		pollActivity = nil
 	}
 
+	/// Whether an account is due a poll: always, unless its mail is pushed to it.
+	private func shouldPoll(_ id: String) -> Bool {
+		guard pushed.contains(id) else { return true }
+		guard Date().timeIntervalSince(lastPolled[id] ?? .distantPast) >= pushedPollInterval - 1 else { return false }
+		lastPolled[id] = Date()
+		return true
+	}
+
 	/// A quick sync of the account in view and of every other saved account, so mail for any of
 	/// them is noticed. Errors on the others are ignored; they show when that account is opened.
 	private func pollAll() {
-		sync(quick: true)
-		guard let core else { return }
+		updatePollActivity()
 		let current = account?.id
-		for other in accountList where other.id != current && KeychainCredentialStore().load(accountId: other.id) != nil {
+		if let current, shouldPoll(current) { sync(quick: true) }
+		guard let core else { return }
+		for other in accountList where other.id != current && shouldPoll(other.id) && KeychainCredentialStore().load(accountId: other.id) != nil {
 			let id = other.id
 			quietSyncs.insert(id)
 			Task {
@@ -912,13 +982,16 @@ final class MailStore {
 		case .mailboxesChanged: scheduleRefresh(mailboxes: true)
 		case .messagesChanged, .newMail: scheduleRefresh(list: true)
 		case .outboxChanged: checkOutbox()
-		case .messageSent(_, let subject): showToast("Message sent", detail: subject, icon: .check)
+		case .messageSent(let account, let subject):
+			showToast("Message sent", detail: subject, icon: .check)
+			finishPendingReply(account: account, subject: subject, sent: true)
 		}
 	}
 
 	private func checkOutbox() {
 		guard let core, account != nil else { return }
 		if let bad = (try? core.outbox(accountId: accountID))?.first(where: { $0.error != nil }) {
+			finishPendingReply(account: accountID, subject: bad.subject, sent: false)
 			toast = nil
 			banner = "“\(bad.subject.isEmpty ? "A message" : bad.subject)” could not be sent: \(bad.error ?? "unknown error")"
 		}
@@ -928,8 +1001,10 @@ final class MailStore {
 
 	func refreshMailboxes() {
 		guard let core, account != nil else { return }
-		mailboxes = (try? core.mailboxes(accountId: accountID)).map { overlayingFolderChanges($0, accountID: accountID) } ?? mailboxes
-		identities = (try? core.identities(accountId: accountID)) ?? identities
+		if let loaded = (try? core.mailboxes(accountId: accountID)).map({ overlayingFolderChanges($0, accountID: accountID) }), loaded != mailboxes {
+			mailboxes = loaded
+		}
+		if let loaded = try? core.identities(accountId: accountID), loaded != identities { identities = loaded }
 		if let a = account { loadAvatars(for: a) }
 		updateBadge()
 		if let id = scopeID, !mailboxes.contains(where: { $0.id == id && $0.isAccount }) { setScope(nil) }
@@ -1339,7 +1414,26 @@ final class MailStore {
 		}
 	}
 
-	var subtitle: String { "\(total) message\(total == 1 ? "" : "s")" }
+	/// Whether the list holds only unread mail when it is listed: the unread filter, Today, or a tab
+	/// that requires unread mail.
+	private var listsUnreadMail: Bool {
+		if unreadOnly { return true }
+		switch sidebar {
+		case .smartToday: return true
+		case .customTab(let id):
+			guard let tab = customTab(id), tab.matchAll else { return false }
+			return tab.activeRules.contains { $0.kind == .unread }
+		default: return false
+		}
+	}
+
+	/// What the list column says under its title. A list of unread mail keeps a message in it after it
+	/// is opened (so it does not vanish under the reader), but that message is no longer unread, so the
+	/// count is of the unread rows: it goes down with the Inbox's own number as mail is read.
+	var subtitle: String {
+		if listsUnreadMail { return "\(messages.lazy.filter { !$0.seen }.count) unread" }
+		return "\(total) message\(total == 1 ? "" : "s")"
+	}
 
 	// MARK: Listing (local store reads; the core keeps it current)
 
@@ -1375,19 +1469,107 @@ final class MailStore {
 		}
 	}
 
+	// MARK: Unread mail beyond what is stored
+
+	/// When each folder's unread mail was last read from the server.
+	@ObservationIgnored private var unreadFetchedAt: [String: Date] = [:]
+	@ObservationIgnored private var unreadTask: Task<Void, Never>?
+	/// Unread mail is being read in from the server for the list in view.
+	private(set) var isFetchingUnread = false
+
+	/// The store holds the newest mail of each folder, so unread mail further back would be missing
+	/// from the unread filter while the sidebar, which counts on the server, includes it. Asks the
+	/// server for the unread mail of the folders in view (at most once a minute each), then lists again.
+	private func fetchUnreadIfNeeded(_ sources: [(account: String, folder: Folder)]) {
+		guard unreadOnly, let core else { return }
+		let now = Date()
+		let due = sources.filter { now.timeIntervalSince(unreadFetchedAt["\($0.account)|\($0.folder)"] ?? .distantPast) > 60 }
+		guard !due.isEmpty else { return }
+		for source in due { unreadFetchedAt["\(source.account)|\(source.folder)"] = now }
+		let context = listContext
+		unreadTask?.cancel()
+		isFetchingUnread = true
+		unreadTask = Task { [weak self] in
+			var fetched: UInt32 = 0
+			for source in due where !Task.isCancelled {
+				fetched += (try? await core.fetchUnread(accountId: source.account, folder: source.folder)) ?? 0
+			}
+			guard let self, !Task.isCancelled else { return }
+			self.isFetchingUnread = false
+			if fetched > 0, self.listContext == context { self.invalidateCaches(); self.reload() }
+		}
+	}
+
+	// MARK: Search
+
+	/// What the server found for a search, kept beside the stored mail it was found beyond.
+	@ObservationIgnored private var serverHits: (query: String, list: [MessageSummary])?
+	@ObservationIgnored private var searchTask: Task<Void, Never>?
+	@ObservationIgnored private var serverSearchTask: Task<Void, Never>?
+	/// The server is being asked about the search in the box.
+	private(set) var isSearchingServer = false
+
+	/// The search box changed. Stored mail is searched at once, as the keystroke lands (several in
+	/// one turn of the run loop make one search); the server is asked when typing pauses, and only
+	/// when what is stored here does not already fill a screen.
+	func searchChanged() {
+		searchTask?.cancel()
+		serverSearchTask?.cancel()
+		let q = searchText.trimmingCharacters(in: .whitespaces)
+		if serverHits?.query != q { serverHits = nil }
+		if q.isEmpty { isSearchingServer = false }
+		searchTask = Task { [weak self] in
+			await Task.yield()
+			guard let self, !Task.isCancelled else { return }
+			self.reload()
+			guard q.count >= 3, self.activeView == nil, self.messages.count < 50, let core = self.core else {
+				self.isSearchingServer = false
+				return
+			}
+			self.isSearchingServer = false
+			self.serverSearchTask = Task { [weak self] in
+				try? await Task.sleep(for: .milliseconds(450))
+				guard let self, !Task.isCancelled else { return }
+				let id = self.accountID
+				self.isSearchingServer = true
+				let found = try? await core.searchServer(accountId: id, query: q, limit: 50)
+				guard !Task.isCancelled, self.accountID == id,
+					  self.searchText.trimmingCharacters(in: .whitespaces) == q else { return }
+				self.isSearchingServer = false
+				if let found, !found.isEmpty {
+					self.serverHits = (q, found)
+					self.invalidateCaches()
+					self.reload()
+				}
+			}
+		}
+	}
+
 	func reload() {
 		guard let core, account != nil else { return }
 		resetOlderIfListChanged()
 		if activeView != nil { reloadView(); return }
 		let id = accountID
 		let q = searchText.trimmingCharacters(in: .whitespaces)
+		if q.isEmpty, serverHits != nil { serverHits = nil }
 		var list: [MessageSummary]
 		var count: Int?
 		do {
 			if !q.isEmpty {
 				list = try core.search(accountId: id, query: q, limit: 300).filter(matchesSidebar)
+				// What the server found beyond what is stored here follows, newest first with the rest.
+				if let hits = serverHits, hits.query == q {
+					let have = Set(list.map(\.id))
+					list += hits.list.filter { !have.contains($0.id) && matchesSidebar($0) }
+					list.sort { $0.receivedAt > $1.receivedAt }
+				}
 			} else if sidebar == .remindMe {
 				list = reminders.keys.compactMap { try? core.messageSummary(accountId: id, messageId: $0) }.filter(inScope).sorted { $0.receivedAt > $1.receivedAt }
+			} else if unreadOnly, let folder {
+				// Unread mail is asked of the store (and, once, of the server), not found by scanning the
+				// newest rows: the unread count counts mail older than anything stored here.
+				list = try core.unreadMessages(accountId: id, folder: folder, limit: 1000).filter(matchesSidebar)
+				fetchUnreadIfNeeded([(id, folder)])
 			} else if let folder, !unreadOnly {
 				let page = try fetch(id, folder, limit: UInt32(pageLimit))
 				list = page.list
@@ -1403,8 +1585,9 @@ final class MailStore {
 		}
 		if unreadOnly { list = list.filter { !$0.seen } }
 		list = keepingOpened(list)
-		messages = list
-		total = count ?? list.count
+		if messages != list { messages = list }
+		let newTotal = count ?? list.count
+		if total != newTotal { total = newTotal }
 		// Only a plain folder pages; search, filters and lists worked out in memory do not.
 		let pages = q.isEmpty && !unreadOnly && sidebar != .remindMe
 		setOlderSources(pages ? folder.map { [OlderSource(account: id, folder: $0)] } ?? [] : [])
@@ -1505,10 +1688,15 @@ final class MailStore {
 				}
 			} else {
 				for source in paged {
+					if unreadOnly, let core {
+						list += try core.unreadMessages(accountId: source.account, folder: source.folder, limit: 1000).map { tag($0, source.account) }
+						continue
+					}
 					let page = try fetch(source.account, source.folder, limit: filtered ? scanLimit : UInt32(pageLimit))
 					list += page.list.map { tag($0, source.account) }
 					count += page.count
 				}
+				if unreadOnly { fetchUnreadIfNeeded(paged) }
 				for source in scanned {
 					list += try fetch(source.account, source.folder, limit: scanLimit).list.filter { matches(source.account, $0) }.map { tag($0, source.account) }
 				}
@@ -1521,8 +1709,9 @@ final class MailStore {
 		list.sort { $0.receivedAt > $1.receivedAt }
 		if !filtered { list = Array(list.prefix(pageLimit)) }
 		list = keepingOpened(list)
-		messages = list
-		total = filtered ? list.count : count
+		if messages != list { messages = list }
+		let newTotal = filtered ? list.count : count
+		if total != newTotal { total = newTotal }
 		setOlderSources(filtered || !q.isEmpty ? [] : paged.map { OlderSource(account: $0.account, folder: $0.folder) })
 	}
 
@@ -1630,7 +1819,7 @@ final class MailStore {
 	var canLoadMore: Bool { messages.count < total || (!reachedEnd && !olderSources.isEmpty) }
 
 	/// The list is empty for now but mail is on its way, so it shows placeholder rows, not "No Messages".
-	var isAwaitingMail: Bool { messages.isEmpty && (isSyncing || isLoadingMore || (canLoadMore && !loadMoreFailed)) }
+	var isAwaitingMail: Bool { messages.isEmpty && (isSyncing || isLoadingMore || isFetchingUnread || (canLoadMore && !loadMoreFailed)) }
 
 	/// Starts the older-mail state over when the list is of something else.
 	private func resetOlderIfListChanged() {
@@ -1670,7 +1859,8 @@ final class MailStore {
 		let screen = max(screenRows, 1)
 		let localBelow = rowsBelow + (total - messages.count)
 		if rowsBelow < 2 * screen, messages.count < total {
-			pageLimit += pageSize
+			// Geometric, so a store holding thousands of messages is not re-read in many small steps.
+			pageLimit += max(pageSize, pageLimit / 2)
 			reload()
 		}
 		if localBelow < 4 * screen { fetchOlder() }
@@ -1752,6 +1942,7 @@ final class MailStore {
 		detailTask?.cancel()
 		markReadTask?.cancel()
 		guard let id, let core else { return }
+		prefetchNeighbors(of: id)
 		if let m = messages.first(where: { $0.id == id }), !m.seen {
 			if openedContext != listContext { opened.removeAll(); openedContext = listContext }
 			opened[id] = m
@@ -1765,6 +1956,30 @@ final class MailStore {
 				if !Task.isCancelled, self?.selectedID == id { self?.detail = Self.tagged(d, id: id) }
 			} catch { if !Task.isCancelled { self?.banner = describe(error) } }
 		}
+	}
+
+	/// Reads the bodies of the messages around the one opened, once the reader pauses, so moving to
+	/// the next or previous one finds them already on this Mac.
+	@ObservationIgnored private var prefetchTask: Task<Void, Never>?
+
+	private func prefetchNeighbors(of id: String) {
+		prefetchTask?.cancel()
+		prefetchTask = Task { [weak self] in
+			try? await Task.sleep(for: .milliseconds(150))
+			guard let self, !Task.isCancelled, let core = self.core,
+				  let index = self.messages.firstIndex(where: { $0.id == id }) else { return }
+			var byAccount: [String: [String]] = [:]
+			for message in self.messages[max(0, index - 1)...min(self.messages.count - 1, index + 4)] where message.id != id {
+				let (account, raw) = self.owner(of: message.id)
+				byAccount[account, default: []].append(raw)
+			}
+			for (account, ids) in byAccount { try? await core.prefetchBodies(accountId: account, messageIds: ids) }
+		}
+	}
+
+	/// Changes how much mail of each folder the core keeps (and fills toward) on this Mac.
+	func setOfflineDepth(_ depth: Int) {
+		core?.setOfflineDepth(depth: UInt32(clamping: depth))
 	}
 
 	// MARK: Multiple selection
@@ -2076,9 +2291,9 @@ final class MailStore {
 	/// Queues a message in the core's outbox off the main thread (queuing copies attachments). A
 	/// failure to queue is reported and handed to `onFailure`; a failure to deliver surfaces through
 	/// the outbox event.
-	private func enqueue(_ message: OutgoingMessage, accountID acct: String, send: Bool, onSuccess: (() -> Void)? = nil, onFailure: @escaping () -> Void) {
+	private func enqueue(_ message: OutgoingMessage, accountID acct: String, send: Bool, showsProgress: Bool = true, onSuccess: (() -> Void)? = nil, onFailure: @escaping () -> Void) {
 		guard let core else { return }
-		if send {
+		if send && showsProgress {
 			// Stays up until the core reports the message sent, or that it could not be.
 			showToast("Sending…", detail: message.subject, icon: .send, isProgress: true, duration: 60)
 		}
@@ -2128,6 +2343,24 @@ final class MailStore {
 
 	var overlayMenu: OverlayMenu?
 
+	/// A reply from the reply box that is queued and waiting for the core to say it reached the server.
+	private struct PendingReply {
+		let id = UUID()
+		let accountID: String
+		let subject: String
+		let finish: () -> Void
+		let fail: () -> Void
+	}
+
+	@ObservationIgnored private var pendingReplies: [PendingReply] = []
+
+	/// Ends the wait of the first pending reply with this account and subject: sent, or failed in the outbox.
+	private func finishPendingReply(account: String, subject: String, sent: Bool) {
+		guard let index = pendingReplies.firstIndex(where: { $0.accountID == account && $0.subject == subject }) else { return }
+		let pending = pendingReplies.remove(at: index)
+		if sent { pending.finish() } else { pending.fail() }
+	}
+
 	/// Replies sent from the reply box this session, by the listed message they answer.
 	private(set) var sentReplies: [String: [SentReply]] = [:]
 
@@ -2135,25 +2368,39 @@ final class MailStore {
 	/// the subject, threading, signature and quoted original. The reply box keeps its text (and shows a
 	/// spinner) until the core reports the reply sent: then `onSent` runs and the reply joins the
 	/// message as a sent reply. If it can't be sent, `onFailure` runs and the text is still there.
-	func sendQuickReply(to id: String, html: String, onSent: @escaping () -> Void, onFailure: @escaping () -> Void) {
+	func sendQuickReply(to id: String, html: String, attachments: [OutgoingAttachment] = [], onSent: @escaping () -> Void, onFailure: @escaping () -> Void) {
 		guard let core else { onFailure(); return }
 		let (acct, raw) = owner(of: id)
 		let key = quickReplyKey(id)
-		showToast("Sending…", detail: messages.first { $0.id == id }.map { "Re: \($0.subject)" } ?? "", icon: .send, isProgress: true, duration: 60)
 		Task {
 			do {
 				var reply = draft(from: try await core.composeTemplate(accountId: acct, messageId: raw, kind: .reply), title: "Reply", accountID: acct)
 				// The template's body is the signature, which goes below what was written.
 				reply.body = reply.body.isEmpty ? html : html + reply.body
+				reply.attachments += attachments
 				let message = try outgoing(reply)
 				guard !message.to.isEmpty else { throw CoreError.InvalidInput(message: "This message has no address to reply to.") }
 				let sent = SentReply(html: html, to: message.to.map(\.formatted).joined(separator: ", "), accountID: acct, date: .now)
-				enqueue(message, accountID: acct, send: true, onSuccess: { [weak self] in
+				// No progress toast: the core's "Message sent" appears once it is out.
+				enqueue(message, accountID: acct, send: true, showsProgress: false, onSuccess: { [weak self] in
 					guard let self else { return }
-					quickReplies.set("", for: key)
-					withAnimation(.snappy(duration: 0.35)) {
-						self.sentReplies[id, default: []].append(sent)
-						onSent()
+					// Queued, not sent yet: the box keeps its spinner until the core reports the reply out.
+					let finish: () -> Void = { [weak self] in
+						guard let self else { return }
+						quickReplies.set("", for: key)
+						withAnimation(.snappy(duration: 0.35)) {
+							self.sentReplies[id, default: []].append(sent)
+							onSent()
+						}
+					}
+					let pending = PendingReply(accountID: acct, subject: message.subject, finish: finish, fail: onFailure)
+					pendingReplies.append(pending)
+					// Offline or slow: it stays queued and goes out later, so don't hold the box forever.
+					Task { [weak self] in
+						try? await Task.sleep(for: .seconds(120))
+						guard let self, let index = pendingReplies.firstIndex(where: { $0.id == pending.id }) else { return }
+						pendingReplies.remove(at: index)
+						finish()
 					}
 				}, onFailure: onFailure)
 			} catch {
