@@ -149,18 +149,27 @@ struct ComposerEditor: NSViewRepresentable {
 	final class ComposerWebView: WKWebView {
 		var onFiles: ([URL]) -> Void = { _ in }
 
-		private func files(_ info: NSDraggingInfo) -> [URL] {
-			(info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-		}
+		private func hasFiles(_ info: NSDraggingInfo) -> Bool { AttachmentFiles.canAttach(from: info.draggingPasteboard) }
 
-		override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { files(sender).isEmpty ? super.draggingEntered(sender) : .copy }
-		override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { files(sender).isEmpty ? super.draggingUpdated(sender) : .copy }
-		override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { files(sender).isEmpty ? super.prepareForDragOperation(sender) : true }
+		override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { hasFiles(sender) ? .copy : super.draggingEntered(sender) }
+		override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { hasFiles(sender) ? .copy : super.draggingUpdated(sender) }
+		override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { hasFiles(sender) ? true : super.prepareForDragOperation(sender) }
 		override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-			let urls = files(sender)
+			guard hasFiles(sender) else { return super.performDragOperation(sender) }
+			let urls = AttachmentFiles.urls(from: sender.draggingPasteboard)
 			guard !urls.isEmpty else { return super.performDragOperation(sender) }
 			onFiles(urls)
 			return true
+		}
+
+		/// Cmd-V with files or a picture on the clipboard attaches them instead of pasting.
+		override func performKeyEquivalent(with event: NSEvent) -> Bool {
+			let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+			if flags == .command, event.charactersIgnoringModifiers == "v", AttachmentFiles.shouldAttachPaste(.general) {
+				let urls = AttachmentFiles.urls(from: .general)
+				if !urls.isEmpty { onFiles(urls); return true }
+			}
+			return super.performKeyEquivalent(with: event)
 		}
 	}
 
@@ -192,7 +201,8 @@ struct ComposerEditor: NSViewRepresentable {
 		<style>
 		html,body{margin:0;background:transparent;height:100%}
 		body{font:14px/1.45 -apple-system,system-ui}
-		#ed{min-height:100%;box-sizing:border-box;padding:10px 14px;outline:none;word-wrap:break-word}
+		#ed{min-height:100%;box-sizing:border-box;padding:10px 14px;outline:none;word-wrap:break-word;display:flow-root}
+		#ed p{margin:0 0 .6em}#ed p:last-child{margin-bottom:0}
 		#ed:empty::before{content:attr(data-placeholder);color:#8e8e93;pointer-events:none}
 		blockquote{margin:0 0 0 2px;padding-left:12px;border-left:3px solid rgba(128,128,128,.45);color:inherit;opacity:.85}
 		a{color:#0a84ff}img{max-width:100%;height:auto}pre{font-family:inherit}\(fit)
@@ -226,8 +236,9 @@ struct ComposerEditor: NSViewRepresentable {
 			if (saved && s) { s.removeAllRanges(); s.addRange(saved); }
 		};
 		const esc = s => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-		ed.addEventListener("input", () => { emit(); state(); });
-		if (window.ResizeObserver) new ResizeObserver(() => post("height", ed.offsetHeight)).observe(ed);
+		ed.addEventListener("input", () => { emit(); state(); post("height", height()); });
+		const height = () => Math.ceil(Math.max(ed.getBoundingClientRect().height, ed.scrollHeight));
+		if (window.ResizeObserver) new ResizeObserver(() => post("height", height())).observe(ed);
 		document.addEventListener("selectionchange", state);
 		ed.addEventListener("paste", e => {
 			e.preventDefault();
@@ -258,7 +269,7 @@ struct ComposerEditor: NSViewRepresentable {
 				ed.focus();
 				const r = document.createRange(); r.selectNodeContents(ed); r.collapse(false);
 				const s = getSelection(); s.removeAllRanges(); s.addRange(r);
-				post("height", ed.offsetHeight);
+				post("height", height());
 			},
 			replaceAll(markup) {
 				ed.focus();
@@ -266,6 +277,9 @@ struct ComposerEditor: NSViewRepresentable {
 				const s = getSelection(); s.removeAllRanges(); s.addRange(r);
 				if (markup === "") document.execCommand("delete"); else document.execCommand("insertHTML", false, markup);
 				emit(); state();
+				// The new text may be taller or shorter; say so now and once layout has settled.
+				post("height", height());
+				requestAnimationFrame(() => post("height", height()));
 			},
 			remember() { const s = getSelection(); saved = s.rangeCount && ed.contains(s.anchorNode) ? s.getRangeAt(0).cloneRange() : null; },
 			link(url) {

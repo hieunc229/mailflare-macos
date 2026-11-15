@@ -1,4 +1,5 @@
 import SwiftUI
+import ImageIO
 import MailflareCore
 
 /// The reply field held at the bottom of the reader, styled as an input. Inactive it is one line (the
@@ -8,6 +9,8 @@ import MailflareCore
 struct QuickReplyBox: View {
 	@Environment(MailStore.self) private var store
 	let message: MessageSummary
+	@Binding var attachments: [OutgoingAttachment]
+	@Binding var error: String?
 
 	@State private var isActive = false
 	@State private var html = ""
@@ -32,6 +35,8 @@ struct QuickReplyBox: View {
 
 	private var key: String { store.quickReplyKey(message.id) }
 	private var isBlank: Bool { PreviewText.plain(html).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+	/// A reply needs words or a file to go.
+	private var canSend: Bool { !isBlank || !attachments.isEmpty }
 	private var placeholder: String { "Reply to \(message.senderDisplay)…" }
 	private var editorHeight: CGFloat { min(max(textHeight, Self.lineHeight), Self.lineHeight * Self.maxLines) }
 
@@ -45,6 +50,8 @@ struct QuickReplyBox: View {
 					.padding(.horizontal, -4)
 					.transition(.opacity)
 			}
+			if !attachments.isEmpty { attachmentChips }
+			if let error { Text(error).font(Typography.meta).foregroundStyle(.red) }
 			ZStack(alignment: .topLeading) {
 				if !isActive || !editorReady { summaryLine }
 				if isActive { editor }
@@ -63,6 +70,43 @@ struct QuickReplyBox: View {
 		.background(OutsideClickMonitor(isActive: isActive && !aiMenuOpen && !aiRunning) { deactivate() })
 		.padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 14)
 		.onAppear { html = store.quickReplies.reply(for: key) }
+		.onChange(of: attachments.count) { old, new in if new > old { activate() } }
+		.attachmentDrop { addFiles($0) }
+	}
+
+	private func addFiles(_ urls: [URL]) {
+		let result = AttachmentFiles.make(from: urls, existing: attachments)
+		attachments += result.attachments
+		error = result.error
+	}
+
+	private var attachmentChips: some View {
+		ScrollView(.horizontal, showsIndicators: false) {
+			HStack(spacing: 8) {
+				ForEach(attachments) { a in
+					let isImage = a.mimeType.hasPrefix("image/") && a.filePath != nil
+					HStack(spacing: 6) {
+						if a.mimeType.hasPrefix("image/"), let path = a.filePath {
+							Button { edit(a, path) } label: {
+								AttachmentThumb(path: path).overlay(alignment: .bottomTrailing) {
+									Image(systemName: "pencil.circle.fill").font(.system(size: 12)).foregroundStyle(.white, .black.opacity(0.6)).offset(x: 3, y: 3)
+								}
+							}
+							.buttonStyle(.plain).help("Preview and edit")
+						} else {
+							HIcon(.attachment, size: 13)
+						}
+						Text(a.name).font(Typography.notice).lineLimit(1)
+						Text(ByteCountFormatter.string(fromByteCount: Int64(a.size), countStyle: .file))
+							.font(Typography.meta).foregroundStyle(.secondary)
+						Button { attachments.removeAll { $0.id == a.id } } label: { HIcon(.close, size: 11) }
+							.buttonStyle(.light).foregroundStyle(.secondary)
+					}
+					.padding(.leading, isImage ? 3 : 14).padding(.trailing, 14).padding(.vertical, isImage ? 3 : 10)
+					.background(AppTheme.composerContextFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+				}
+			}
+		}
 	}
 
 	/// The reply so far on one line, or the prompt when there is none.
@@ -83,6 +127,7 @@ struct QuickReplyBox: View {
 				// In memory now; QuickReplies writes the file at most once a second.
 				store.quickReplies.set(body, for: key)
 			},
+			onFiles: { addFiles($0) },
 			onHeight: { height in
 				guard abs(height - textHeight) > 0.5 else { return }
 				withAnimation(Self.animation) { textHeight = height }
@@ -98,7 +143,7 @@ struct QuickReplyBox: View {
 	private var sendButton: some View {
 		Button(action: send) {
 			Group {
-				if sending { ProgressView().controlSize(.small).scaleEffect(0.65).colorScheme(.dark) } else { HIcon(.sent, size: 14) }
+				if sending { SendSpinner() } else { HIcon(.sent, size: 14) }
 			}
 				.foregroundStyle(AppTheme.prominentPillText)
 				.frame(width: Self.sendSize, height: Self.sendSize)
@@ -106,10 +151,21 @@ struct QuickReplyBox: View {
 				.contentShape(Circle())
 		}
 		.buttonStyle(.plain)
-		.disabled(isBlank || sending || aiRunning)
-		.opacity(isBlank || aiRunning ? 0.4 : 1)
+		.disabled(!canSend || sending || aiRunning)
+		.opacity(!canSend || aiRunning ? 0.4 : 1)
 		.keyboardShortcut(isActive ? KeyboardShortcut(.return, modifiers: .command) : nil)
 		.help("Send Reply (⌘↩)")
+	}
+
+	/// Opens an attached image in the full-window editor; the edited copy replaces it.
+	private func edit(_ a: OutgoingAttachment, _ path: String) {
+		store.imageEditor = ImageEditSession(url: URL(fileURLWithPath: path), name: a.name) { url in
+			guard let i = attachments.firstIndex(where: { $0.id == a.id }) else { return }
+			let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+			if size > AttachmentFiles.limit { error = "The edited image is over the 10 MB upload limit."; return }
+			error = nil
+			attachments[i] = OutgoingAttachment(filePath: url.path, blobId: nil, name: url.lastPathComponent, mimeType: "image/png", size: UInt64(size))
+		}
 	}
 
 	private func activate() {
@@ -127,16 +183,33 @@ struct QuickReplyBox: View {
 
 	private func send() {
 		let body = html
-		guard !isBlank, !sending, !aiRunning else { return }
+		let files = attachments
+		guard canSend, !sending, !aiRunning else { return }
 		sending = true
 		// The text stays until the reply is sent; then it leaves the box and joins the message.
-		store.sendQuickReply(to: message.id, html: body, onSent: {
+		store.sendQuickReply(to: message.id, html: body, attachments: files, onSent: {
 			sending = false
+			attachments = []
+			error = nil
 			html = ""
 			textHeight = Self.lineHeight
 			isActive = false
 			editorReady = false
 		}, onFailure: { sending = false })
+	}
+}
+
+/// A spinning ring in the Send button's text color, so it reads on the button's fill in both themes.
+private struct SendSpinner: View {
+	@State private var spinning = false
+
+	var body: some View {
+		Circle()
+			.trim(from: 0, to: 0.75)
+			.stroke(AppTheme.prominentPillText, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+			.frame(width: 14, height: 14)
+			.rotationEffect(.degrees(spinning ? 360 : 0))
+			.onAppear { withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) { spinning = true } }
 	}
 }
 
@@ -173,6 +246,31 @@ private struct OutsideClickMonitor: NSViewRepresentable {
 				}
 				return event
 			}
+		}
+	}
+}
+
+/// A small preview of an image file, decoded at thumbnail size off the main thread.
+struct AttachmentThumb: View {
+	let path: String
+	@State private var image: NSImage?
+
+	var body: some View {
+		Group {
+			if let image { Image(nsImage: image).resizable().scaledToFill() } else { Color.secondary.opacity(0.15) }
+		}
+		.frame(width: 34, height: 34)
+		.clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+		.task(id: path) {
+			let path = path
+			image = await Task.detached {
+				guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+					  let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+						kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
+						kCGImageSourceThumbnailMaxPixelSize: 80] as CFDictionary)
+				else { return nil as NSImage? }
+				return NSImage(cgImage: cg, size: .zero)
+			}.value
 		}
 	}
 }

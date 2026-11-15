@@ -103,7 +103,7 @@ struct ComposeView: View {
 		.frame(width: 680, height: height)
 		.background(AppTheme.background)
 		.overlay { if isDropTarget { Rectangle().stroke(Color.accentColor, lineWidth: 2) } }
-		.dropDestination(for: URL.self) { urls, _ in addFiles(urls.filter(\.isFileURL)); return true } isTargeted: { isDropTarget = $0 }
+		.attachmentDrop(isTargeted: $isDropTarget) { addFiles($0) }
 		.alert("Save as Template", isPresented: $saveTemplateOpen) {
 			TextField("Title", text: $templateTitle)
 			Button("Save") { store.templates.add(title: templateTitle, html: draft.body) }
@@ -183,15 +183,17 @@ struct ComposeView: View {
 		ScrollView(.horizontal) {
 			HStack(spacing: 8) {
 				ForEach(draft.attachments) { a in
+					let isImage = a.mimeType.hasPrefix("image/") && a.filePath != nil
 					HStack(spacing: 6) {
-						HIcon(.attachment, size: 13)
+						if isImage, let path = a.filePath { AttachmentThumb(path: path) } else { HIcon(.attachment, size: 13) }
 						Text(a.name).font(Typography.notice).lineLimit(1)
 						Text(ByteCountFormatter.string(fromByteCount: Int64(a.size), countStyle: .file))
 							.font(Typography.meta).foregroundStyle(.secondary)
 						Button { draft.attachments.removeAll { $0.id == a.id } } label: { HIcon(.close, size: 11) }
 							.buttonStyle(.light).foregroundStyle(.secondary)
 					}
-					.noticeSurface(radius: 10)
+					.padding(.leading, isImage ? 3 : 14).padding(.trailing, 14).padding(.vertical, isImage ? 3 : 10)
+					.background(AppTheme.composerContextFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 				}
 			}
 			.padding(10)

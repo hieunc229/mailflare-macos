@@ -36,6 +36,10 @@ private struct MessageDetail: View {
 	@State private var webHeight: CGFloat = 0
 	/// Remote content the user allowed for this message alone, where the settings would block it.
 	@State private var loadRemoteOnce = false
+	/// Files dropped on the message or the reply box, sent with the quick reply.
+	@State private var replyAttachments: [OutgoingAttachment] = []
+	@State private var dropError: String?
+	@State private var isDropTarget = false
 	@AppStorage(ReadingSettings.loadRemoteContentKey) private var loadRemoteContent = true
 
 	init(message: MessageSummary) {
@@ -63,7 +67,7 @@ private struct MessageDetail: View {
 		content
 			.safeAreaInset(edge: .bottom, spacing: 0) {
 				if store.role(of: message) != "drafts" {
-					QuickReplyBox(message: message)
+					QuickReplyBox(message: message, attachments: $replyAttachments, error: $dropError)
 						.background {
 							LinearGradient(stops: [
 								.init(color: AppTheme.background.opacity(0), location: 0),
@@ -75,6 +79,12 @@ private struct MessageDetail: View {
 				}
 			}
 		.background(AppTheme.background)
+		.overlay { if isDropTarget && store.role(of: message) != "drafts" { Rectangle().stroke(Color.accentColor, lineWidth: 2).allowsHitTesting(false) } }
+		.attachmentDrop(enabled: store.role(of: message) != "drafts", isTargeted: $isDropTarget) { urls in
+			let result = AttachmentFiles.make(from: urls, existing: replyAttachments)
+			replyAttachments += result.attachments
+			dropError = result.error
+		}
 		.task { store.loadSavedSummary(for: message.id) }
 		.onChange(of: adaptByDefault) { _, _ in store.refreshAdaptColors() }
 	}
@@ -120,15 +130,18 @@ private struct MessageDetail: View {
 				}
 				// Replies sent from the reply box slide in at the end, like the rest of the conversation.
 				ForEach(store.sentReplies[message.id] ?? []) { reply in
-					SentReplyView(reply: reply)
-						.transition(.move(edge: .bottom).combined(with: .opacity))
+					SentReplyView(reply: reply) {
+						// Its text is measured after it appears, so follow the growth to the bottom.
+						withAnimation(.snappy(duration: 0.3)) { scroller.scrollTo("end", anchor: .bottom) }
+					}
+					.transition(.move(edge: .bottom).combined(with: .opacity))
 				}
 				Color.clear.frame(height: 1).id("end")
 			}
 			.frame(maxWidth: .infinity, alignment: .leading)
 		}
 		.onChange(of: store.sentReplies[message.id]?.count ?? 0) { _, _ in
-			withAnimation(.snappy(duration: 0.35)) { scroller.scrollTo("end", anchor: .bottom) }
+			DispatchQueue.main.async { withAnimation(.snappy(duration: 0.35)) { scroller.scrollTo("end", anchor: .bottom) } }
 		}
 		}
 	}
@@ -253,6 +266,8 @@ private struct MessageDetail: View {
 private struct SentReplyView: View {
 	@Environment(MailStore.self) private var store
 	let reply: MailStore.SentReply
+	/// Called when the text's height is known or changes.
+	var onSized: () -> Void = {}
 	@State private var height: CGFloat = 0
 
 	var body: some View {
@@ -275,6 +290,7 @@ private struct SentReplyView: View {
 			MessageWebView(html: reply.html, mode: .asIs, contentHeight: $height)
 				.frame(height: max(height, 40))
 		}
+		.onChange(of: height) { _, _ in onSized() }
 	}
 }
 
@@ -295,6 +311,8 @@ struct Avatar: View {
 /// it reports its content's height so it can be sized to show all of it.
 private final class PassthroughWebView: WKWebView {
 	override func scrollWheel(with event: NSEvent) { nextResponder?.scrollWheel(with: event) }
+	/// The reader takes no drops itself; leaving them to the page would swallow dropped files.
+	override func registerForDraggedTypes(_ newTypes: [NSPasteboard.PasteboardType]) {}
 }
 
 /// Renders mail HTML with JavaScript off. Remote images, styles and fonts load only when
@@ -316,6 +334,7 @@ struct MessageWebView: NSViewRepresentable {
 		config.userContentController.addUserScript(MessageAppearance.userScript)
 		let view = PassthroughWebView(frame: .zero, configuration: config)
 		view.navigationDelegate = context.coordinator
+		view.unregisterDraggedTypes()
 		view.setValue(false, forKey: "drawsBackground")
 		view.postsFrameChangedNotifications = true
 		context.coordinator.observe(view)
@@ -397,6 +416,27 @@ struct MessageWebView: NSViewRepresentable {
 				return .cancel
 			}
 			return action.navigationType == .other ? .allow : .cancel
+		}
+	}
+}
+
+
+/// Starts WebKit's content process before the first message is opened, so that message does not pay
+/// for it. A web view loads an empty page and is let go a few seconds later.
+@MainActor
+enum WebViewWarmup {
+	private static var view: WKWebView?
+
+	static func run() {
+		guard view == nil else { return }
+		let config = WKWebViewConfiguration()
+		config.defaultWebpagePreferences.allowsContentJavaScript = false
+		let warm = WKWebView(frame: .zero, configuration: config)
+		warm.loadHTMLString("<!doctype html><html><body></body></html>", baseURL: nil)
+		view = warm
+		Task {
+			try? await Task.sleep(for: .seconds(5))
+			view = nil
 		}
 	}
 }
