@@ -22,6 +22,7 @@ struct SettingsView: View {
 					case .notifications: NotificationSettingsPage()
 					case .accounts: AccountSettings()
 					case .ai: AISettingsPage()
+					case .mcp: MCPSettingsPage()
 					case .license: LicenseSettings()
 					case .support: SupportSettings()
 					case .about: AboutSettings()
@@ -46,7 +47,7 @@ private struct OpenDropdownKey: PreferenceKey {
 	static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
-private struct SettingsGroup<Content: View>: View {
+struct SettingsGroup<Content: View>: View {
 	var title: String
 	var footer: String?
 	@ViewBuilder var content: Content
@@ -68,12 +69,12 @@ private struct SettingsGroup<Content: View>: View {
 	}
 }
 
-private struct SettingsDivider: View {
+struct SettingsDivider: View {
 	var body: some View { Rectangle().fill(AppTheme.cardStroke).frame(height: 1) }
 }
 
 /// One line of a group: content with the group's row padding.
-private struct SettingsRow<Content: View>: View {
+struct SettingsRow<Content: View>: View {
 	@ViewBuilder var content: Content
 
 	var body: some View {
@@ -105,7 +106,7 @@ private struct SettingsToggle: View {
 
 /// A choice drawn as its current value and a chevron; opening it drops a card like the account
 /// dropdown's, with a check on the chosen row.
-private struct SettingsPicker<Value: Hashable>: View {
+struct SettingsPicker<Value: Hashable>: View {
 	var title: String
 	var options: [(label: String, value: Value)]
 	@Binding var selection: Value
@@ -287,7 +288,7 @@ private struct ModelPickerRow: View {
 }
 
 /// A button as wide as the page, outside any group.
-private struct WideButton: View {
+struct WideButton: View {
 	var title: String
 	var icon: AppIcon?
 	var prominent = false
@@ -315,6 +316,8 @@ private struct GeneralSettings: View {
 	@AppStorage(ReadingSettings.markReadDelayKey) private var markReadDelay = 0
 	@AppStorage(ReadingSettings.loadRemoteContentKey) private var loadRemote = true
 	@AppStorage(ReadingSettings.showAvatarsKey) private var showAvatars = true
+	@AppStorage(ReadingSettings.offlineDepthKey) private var offlineDepth = 1000
+	@Environment(MailStore.self) private var store
 	@State private var launchAtLogin = LaunchAtLogin.isEnabled
 
 	var body: some View {
@@ -356,7 +359,17 @@ private struct GeneralSettings: View {
 				detail: "Images, styles and fonts a message loads from the internet. Always blocked in Spam.",
 				isOn: $loadRemote)
 		}
+		SettingsGroup(title: "Storage") {
+			SettingsPicker(
+				title: "Keep on this Mac",
+				options: [("Newest 50 per folder", 50), ("1,000 per folder", 1000), ("5,000 per folder", 5000), ("25,000 per folder", 25000), ("Everything", Int(UInt32.max))],
+				selection: $offlineDepth)
+			Text("Mail kept here opens, scrolls and searches without waiting for the server. Older mail is downloaded in the background after each sync.")
+				.font(Typography.meta).foregroundStyle(.secondary)
+				.padding(.horizontal, 14).padding(.bottom, 10)
+		}
 		.onChange(of: appearance) { _, value in (AppAppearance(rawValue: value) ?? .system).apply() }
+		.onChange(of: offlineDepth) { _, value in store.setOfflineDepth(value) }
 	}
 }
 

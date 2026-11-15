@@ -7,6 +7,8 @@ enum Typography {
 	static let baseSize: CGFloat = 14
 	/// Extra space between lines in the assistant chat: a line height of 1.5 times the size.
 	static let chatLineSpacing: CGFloat = baseSize * 0.5 - 3
+	/// Space between a run of text and anything else in an answer (tables, steps, code): 1.5 lines.
+	static let chatBlockGap: CGFloat = 20
 	static let body = Font.system(size: baseSize, weight: .regular)
 	static let bodySemibold = Font.system(size: baseSize, weight: .semibold)
 	static let notice = Font.system(size: baseSize - 1, weight: .regular)

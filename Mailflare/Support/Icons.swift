@@ -8,7 +8,7 @@ enum AppIcon: String {
 	case moreDown, search, allInboxes, vip, remind, drafts, sent, smartMailbox, inbox
 	case attachment, summarize, aiContent, chevronRight, chevronDown, clock, close, send, add, addCircle, check, signOut, appearance, settings, info, more, bell
 	case crown, arrowLeft, sparkles, edit, colors, download, copy, label, unsubscribe, block, sourceCode, cancel, minimize, bold, italic, underline, strikethrough, bulletList, numberList, quote, link, clearFormat, undo, redo, support, markRead, markUnread, unflag
-	case notificationOff, calendar, cart, money, person, work, travel, home, bookmark, parcel
+	case notificationOff, calendar, cart, money, person, work, travel, home, bookmark, parcel, refresh, expand, shrink
 
 	/// The image in `Assets.xcassets/Icons`.
 	var assetName: String { "Icons/" + fileName }
@@ -90,6 +90,9 @@ enum AppIcon: String {
 		case .home: "home01"
 		case .bookmark: "bookmark01"
 		case .parcel: "package"
+		case .refresh: "refresh01"
+		case .expand: "arrow-expand"
+		case .shrink: "arrow-shrink"
 		}
 	}
 }
